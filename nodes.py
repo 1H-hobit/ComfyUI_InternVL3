@@ -37,9 +37,10 @@ class InternVLModelLoader:
                         "OpenGVLab/InternVL3-1B",
                         "OpenGVLab/InternVL3-2B",
                         "OpenGVLab/InternVL3-8B",
+                        "OpenGVLab/InternVL3-14B-Instruct",
                     ],
                     {
-                        "default": "OpenGVLab/InternVL3-2B"
+                        "default": "OpenGVLab/InternVL3-14B-Instruct"
                     }),
             }
         }
@@ -66,8 +67,8 @@ class InternVLModelLoader:
 
         model = AutoModel.from_pretrained(
             model_dir,
-            load_in_8bit=True,
-            #load_in_4bit=True,
+            #load_in_8bit=True,
+            load_in_4bit=True,
             torch_dtype=torch.float16,
             low_cpu_mem_usage=True,
             #device_map="auto",
