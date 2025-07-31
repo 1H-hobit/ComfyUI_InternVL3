@@ -21,6 +21,7 @@ from transformers import TextIteratorStreamer
 from threading import Thread
 import torchvision.transforms as T
 from torchvision.transforms.functional import InterpolationMode  # 图像插值模式
+from decord import VideoReader, cpu
 
 # 添加类变量缓存模型
 loaded_model = None
@@ -279,6 +280,8 @@ class DynamicPreprocess:
 class InternVLHFInference:
     global loaded_model
     global InternVL_model_name
+    video_IMAGENET_MEAN = (0.485, 0.456, 0.406)
+    video_IMAGENET_STD = (0.229, 0.224, 0.225)
 
     @classmethod
     def INPUT_TYPES(s):
@@ -295,6 +298,7 @@ class InternVLHFInference:
             },
             "optional": {
                 "image": ("IMAGE",),
+                "video_path": ("STRING", {"default": ""}),
                 "model": ("InternVLModel",),
                 "keep_model_loaded": ("BOOLEAN", {"default": False}),
                 "max_new_tokens": ("INT", {"default": 1024, "min": 1, "max": 4096}),
@@ -311,6 +315,7 @@ class InternVLHFInference:
                 system_prompt,  # 必需参数第一位
                 prompt,         # 必需参数第二位
                 image=None,     # 可选参数，添加默认值
+                video_path=None,# 可选参数，添加默认值
                 model=None,     # 可选参数，添加默认值
                 keep_model_loaded=False,
                 max_new_tokens=1024,
@@ -364,9 +369,37 @@ class InternVLHFInference:
         streamer = TextIteratorStreamer(tokenizer, timeout=60)
         generation_config = dict(max_new_tokens=max_new_tokens, do_sample=do_sample, streamer=streamer)
 
+        # 处理视频输入
+        if video_path and video_path.strip():
+            print("处理视频输入")
+            
+            # 加载并处理视频（设置8个时间段，每个时间取1个分块）
+            pixel_values, num_patches_list = self.video_load_video(video_path, num_segments=8, max_num=1)
+
+            # 确保数据在GPU上
+            if torch.cuda.is_available():
+                # 将数据转换为bfloat16格式并转移到GPU
+                pixel_values = pixel_values.to(torch.float16).cuda()
+                
+            # 构造视频前缀：为每个帧生成"FrameX: <image>\n"格式的文本
+            video_prefix = ''.join([f'Frame{i+1}: <image>\n' for i in range(len(num_patches_list))])
+            question = f'{video_prefix}\n{system_prompt}\n{prompt}'
+
+            # 启动生成线程
+            Thread(target = internvl_model.chat, kwargs={
+                "tokenizer": tokenizer,
+                "pixel_values": pixel_values,  # 使用处理后的张量
+                "question": question,
+                "generation_config": generation_config,
+                "num_patches_list": num_patches_list,
+                "history": None,  # 关键修改：每次使用空历史
+                "return_history": False  # 不再需要返回历史
+            }).start()
+
 
         # 处理图像输入
-        if image is not None:
+        elif image is not None:
+            print("处理图像输入")
             image = image.to(torch.float16).to(device)
             num_patches_list = [image.size(0)]  # 有图像时设置
 
@@ -383,7 +416,10 @@ class InternVLHFInference:
                 "return_history": False  # 不再需要返回历史
             }).start()
 
+
+
         else:
+            print("纯文本推理")
             # 如果没有图像输入，创建一个空张量占位
             # image = torch.zeros(1, 3, 448, 448, dtype=torch.float16, device=device)
             # num_patches_list = [1]   # 无图像时设置
@@ -436,6 +472,144 @@ class InternVLHFInference:
             print("✅ 临时模型已卸载")
         
         return (response,)
+    
+
+    # 定义函数：根据时间范围和视频参数计算需要抽取的帧索引
+    def video_get_index(self,bound, fps, max_frame, first_idx=0, num_segments=32):
+        """参数说明：
+        bound: 时间范围元组(start_sec, end_sec)
+        fps: 视频帧率（帧/秒）
+        max_frame: 视频总帧数
+        first_idx: 起始帧索引（默认0）
+        num_segments: 需要分割的视频段数（默认32）"""
+        
+        # 处理时间边界
+        if bound:  # 如果指定了时间范围
+            start, end = bound[0], bound[1]  # 获取开始和结束时间（秒）
+        else:  # 未指定则使用极大范围
+            start, end = -100000, 100000
+        
+        # 计算起始和结束帧索引
+        start_idx = max(first_idx, round(start * fps))  # 转换为帧索引，确保不小于first_idx
+        end_idx = min(round(end * fps), max_frame)  # 结束帧不超过视频最大帧
+        
+        # 计算每个视频段的长度（以帧为单位）
+        seg_size = float(end_idx - start_idx) / num_segments
+        
+        # 生成每个视频段的中心帧索引
+        frame_indices = np.array([
+            int(start_idx + (seg_size / 2) + np.round(seg_size * idx))
+            for idx in range(num_segments)
+        ])
+        return frame_indices  # 返回32个均匀分布的帧索引
+
+
+    # 定义视频加载和处理函数
+    def video_load_video(self,video_path, bound=None, input_size=448, max_num=1, num_segments=32):
+        """参数说明：
+        video_path: 视频文件路径
+        bound: 时间范围（秒）
+        input_size: 输入图像尺寸（默认448x448）
+        max_num: 最大分块数量（动态预处理用）
+        num_segments: 视频分割段数"""
+        
+        # 初始化视频阅读器
+        vr = VideoReader(video_path, ctx=cpu(0), num_threads=1)  # 使用CPU单线程读取
+        max_frame = len(vr) - 1  # 获取视频总帧数（索引从0开始）
+        fps = float(vr.get_avg_fps())  # 获取视频平均帧率
+
+        # 初始化存储容器
+        pixel_values_list = []  # 存储处理后的图像张量
+        num_patches_list = []   # 存储每帧的分块数量
+        
+        # 创建图像预处理流水线
+        transform = self.video_build_transform(input_size=input_size)  # 包含缩放、归一化等操作
+        
+        # 获取需要处理的帧索引
+        frame_indices = self.video_get_index(bound, fps, max_frame, first_idx=0, num_segments=num_segments)
+        
+        # 遍历每个选定帧进行处理
+        for frame_index in frame_indices:
+            # 读取帧并转换为PIL图像
+            img = Image.fromarray(vr[frame_index].asnumpy()).convert('RGB')
+            
+            # 动态预处理（可能包含分块、缩略图处理等）
+            img = self.video_preprocess(img, 
+                                    image_size=input_size,
+                                    use_thumbnail=True,
+                                    max_num=max_num)
+            
+            # 对每个分块应用预处理
+            pixel_values = [transform(tile) for tile in img]
+            pixel_values = torch.stack(pixel_values)  # 堆叠分块张量
+            
+            # 记录分块数量和预处理结果
+            num_patches_list.append(pixel_values.shape[0])
+            pixel_values_list.append(pixel_values)
+        
+        # 合并所有帧的分块数据
+        pixel_values = torch.cat(pixel_values_list)
+        return pixel_values, num_patches_list
+    
+    def video_build_transform(self, input_size):
+        MEAN, STD = self.video_IMAGENET_MEAN, self.video_IMAGENET_STD
+        transform = T.Compose([
+            T.Lambda(lambda img: img.convert('RGB') if img.mode != 'RGB' else img),
+            T.Resize((input_size, input_size), interpolation=InterpolationMode.BICUBIC),
+            T.ToTensor(),
+            T.Normalize(mean=MEAN, std=STD)
+        ])
+        return transform
+    
+    def video_preprocess(self, image, min_num=1, max_num=12, image_size=448, use_thumbnail=True):
+        orig_width, orig_height = image.size
+        aspect_ratio = orig_width / orig_height
+
+        # 生成所有可能的宽高比组合
+        target_ratios = set(
+            (i, j) for n in range(min_num, max_num + 1) 
+            for i in range(1, n + 1) for j in range(1, n + 1) 
+            if i * j <= max_num and i * j >= min_num)
+        target_ratios = sorted(target_ratios, key=lambda x: x[0] * x[1])
+
+        # 寻找与给定aspect_ratio最接近的宽高比
+        target_aspect_ratio = self.video_find_closest_aspect_ratio(
+            aspect_ratio, target_ratios, orig_width, orig_height, image_size)
+
+        target_width = image_size * target_aspect_ratio[0]
+        target_height = image_size * target_aspect_ratio[1]
+        blocks = target_aspect_ratio[0] * target_aspect_ratio[1]
+
+        resized_img = image.resize((target_width, target_height))
+        processed_images = []
+        for i in range(blocks):
+            box = (
+                (i % (target_width // image_size)) * image_size,
+                (i // (target_width // image_size)) * image_size,
+                ((i % (target_width // image_size)) + 1) * image_size,
+                ((i // (target_width // image_size)) + 1) * image_size
+            )
+            processed_images.append(resized_img.crop(box))  # 裁剪子图
+
+        # 可选添加缩略图
+        if use_thumbnail and len(processed_images) != 1:
+            processed_images.append(image.resize((image_size, image_size)))
+        return processed_images
+
+    def video_find_closest_aspect_ratio(self, aspect_ratio, target_ratios, width, height, image_size):
+        best_ratio_diff = float('inf')
+        best_ratio = (1, 1)
+        area = width * height
+        for ratio in target_ratios:
+            target_aspect_ratio = ratio[0] / ratio[1]
+            ratio_diff = abs(aspect_ratio - target_aspect_ratio)
+            if ratio_diff < best_ratio_diff:
+                best_ratio_diff = ratio_diff
+                best_ratio = ratio
+            elif ratio_diff == best_ratio_diff:
+                if area > 0.5 * image_size * image_size * ratio[0] * ratio[1]:
+                    best_ratio = ratio
+        return best_ratio
     
 
 
