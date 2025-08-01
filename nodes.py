@@ -1,3 +1,7 @@
+# 在文件顶部添加
+from server import PromptServer
+from aiohttp import web  # 添加这行导入
+
 import os
 import folder_paths
 import comfy.model_management as mm
@@ -25,10 +29,10 @@ from decord import VideoReader, cpu
 
 # 添加类变量缓存模型
 loaded_model = None
-InternVL_model_name = None
+InternVL_model_name = "OpenGVLab/InternVL3-14B-Instruct"  # 设置默认模型名称
 
 class InternVLModelLoader:
-    global loaded_model
+    global loaded_model, InternVL_model_name  # 声明使用全局变量
     @classmethod
     def INPUT_TYPES(self):
         return {
@@ -54,7 +58,7 @@ class InternVLModelLoader:
 
 
     def load_model(self, model):
-        global InternVL_model_name
+        global loaded_model, InternVL_model_name  # 声明使用全局变量
         device = mm.get_torch_device()
 
         model_name = model.rsplit('/', 1)[-1]
@@ -76,26 +80,39 @@ class InternVLModelLoader:
             trust_remote_code=True).eval()
         
         tokenizer = AutoTokenizer.from_pretrained(model_dir,trust_remote_code=True)
-        model = {
-                    "model": model,
-                    "tokenizer": tokenizer
-                }
-        InternVLModelLoader.loaded_model = model
-        return (model,)
+        model_dict = {
+            "model": model,
+            "tokenizer": tokenizer
+        }
+        
+        # 更新全局变量
+        loaded_model = model_dict
+        return (model_dict,)
     
-    # 新增：处理前端自定义事件（卸载模型）
-    def handle_custom_event(self, node, event):
-        global loaded_model
+    # 修改方法名为 ComfyUI 标准
+    def HANDLE_CUSTOM_EVENT(self, node, event):
+        global loaded_model, InternVL_model_name
         if event.get("action") == "unload_model":
             if loaded_model is not None:
+                print("开始卸载模型...")
                 # 释放模型资源
                 del loaded_model["model"]
                 del loaded_model["tokenizer"]
                 loaded_model = None
-                torch.cuda.empty_cache()  # 清除GPU缓存
+                # 不要重置模型名称，保留最后一次加载的模型名称
+                
+                # Cleanup
+                import gc
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                    torch.cuda.ipc_collect()
+
                 print("✅ 模型已删除加载")
-        return None
-    
+                return {"result": "success", "message": "模型已卸载"}
+            else:
+                return {"result": "error", "message": "没有加载的模型可卸载"}
+        return {"result": "no_action"}  # 默认返回
 
 
 class DynamicPreprocess:
@@ -292,8 +309,7 @@ class DynamicPreprocess:
         return transform
 
 class InternVLHFInference:
-    global loaded_model
-    global InternVL_model_name
+    global loaded_model, InternVL_model_name  # 声明使用全局变量
     video_IMAGENET_MEAN = (0.485, 0.456, 0.406)
     video_IMAGENET_STD = (0.229, 0.224, 0.225)
 
@@ -335,50 +351,43 @@ class InternVLHFInference:
                 max_new_tokens=1024,
                 do_sample=False):
         
+        global loaded_model, InternVL_model_name  # 声明使用全局变量
+        
         mm.soft_empty_cache()
         device = mm.get_torch_device()
 
         # === 修复：安全的模型加载逻辑 ===
         using_cached_model = False
 
-        #print("loaded_model:\n",InternVLModelLoader.loaded_model)
         print("keep_model_loaded:\n",keep_model_loaded)
 
         # 检查是否使用缓存模型
-        if keep_model_loaded and InternVLModelLoader.loaded_model:
-            model = InternVLModelLoader.loaded_model
+        if keep_model_loaded and loaded_model:  # 使用全局变量
+            model = loaded_model
             print("✅ 使用已缓存的模型")
             using_cached_model = True
             
-        else:
-            print("✅ 使用了传入的模型")
-            
         # =============================
-        
-        model = InternVLModelLoader.loaded_model
-        #print("model:\n",model)
 
         # 确保模型有效
-        if not isinstance(model, dict) or 'model' not in model or model['model'] is None:
+        if model is None or not isinstance(model, dict) or 'model' not in model or model['model'] is None:
             # 需要加载新模型
             model_loader = InternVLModelLoader()
+
+            # 确保有有效的模型名称
+            current_model_name = InternVL_model_name if InternVL_model_name else "OpenGVLab/InternVL3-14B-Instruct"
+
             model = model_loader.load_model(InternVL_model_name)[0]
-            print("✅ 新模型加载成功")
+            print(f"✅ 新模型加载成功: {current_model_name}")
 
-            # keep_model_loaded = True
-            # using_cached_model = True
-
-            # # 缓存模型如果设置了保持加载
-            # if keep_model_loaded:
-            #     InternVLModelLoader.loaded_model = model
-            #     print("✅ 模型已缓存供后续使用")
-            #     keep_model_loaded = False
+            # 缓存模型如果设置了保持加载
+            if keep_model_loaded:
+                loaded_model = model  # 使用全局变量
+                print("✅ 模型已缓存供后续使用")
 
         internvl_model = model['model']
         tokenizer = model['tokenizer']
         
-        #num_patches_list = [image.size(0)]
-
         # 准备流式输出
         streamer = TextIteratorStreamer(tokenizer, timeout=60)
         generation_config = dict(max_new_tokens=max_new_tokens, do_sample=do_sample, streamer=streamer)
@@ -434,10 +443,6 @@ class InternVLHFInference:
 
         else:
             print("纯文本推理")
-            # 如果没有图像输入，创建一个空张量占位
-            # image = torch.zeros(1, 3, 448, 448, dtype=torch.float16, device=device)
-            # num_patches_list = [1]   # 无图像时设置
-
             question = f'{system_prompt}\n{prompt}'
 
             # 启动生成线程
@@ -643,3 +648,29 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "DynamicPreprocess": "Dynamic Preprocess",
     "InternVLHFInference": "InternVL HF Inference",
 }
+
+# 修改文件底部的路由处理函数
+@PromptServer.instance.routes.post("/object_info/{node_class}")
+async def handle_custom_node_event(request):
+    try:
+        post_data = await request.json()
+        node_class = request.match_info.get("node_class", "")
+        action = post_data.get("action")
+        node_id = post_data.get("node_id")
+        
+        # 创建模型加载器实例
+        loader = InternVLModelLoader()
+        
+        if node_class == "InternVLModelLoader" and action == "unload_model":
+            # 调用模型卸载逻辑
+            result = loader.HANDLE_CUSTOM_EVENT(None, {"action": "unload_model"})
+            return web.json_response(result)
+        else:
+            return web.json_response(
+                {"error": "Invalid action or node class"}, status=400
+            )
+    
+    except Exception as e:
+        return web.json_response(
+            {"error": str(e)}, status=500
+        )
