@@ -82,6 +82,20 @@ class InternVLModelLoader:
                 }
         InternVLModelLoader.loaded_model = model
         return (model,)
+    
+    # 新增：处理前端自定义事件（卸载模型）
+    def handle_custom_event(self, node, event):
+        global loaded_model
+        if event.get("action") == "unload_model":
+            if loaded_model is not None:
+                # 释放模型资源
+                del loaded_model["model"]
+                del loaded_model["tokenizer"]
+                loaded_model = None
+                torch.cuda.empty_cache()  # 清除GPU缓存
+                print("✅ 模型已删除加载")
+        return None
+    
 
 
 class DynamicPreprocess:
@@ -467,8 +481,13 @@ class InternVLHFInference:
                 del model['tokenizer']
                 model['tokenizer'] = None
             
-            # 清除GPU缓存
-            torch.cuda.empty_cache()
+            import gc
+            # Cleanup
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.ipc_collect()
+
             print("✅ 临时模型已卸载")
         
         return (response,)
