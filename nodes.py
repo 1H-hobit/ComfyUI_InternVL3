@@ -330,7 +330,7 @@ class InternVLHFInference:
                 "image": ("IMAGE",),
                 "video_path": ("STRING", {"default": ""}),
                 "model": ("InternVLModel",),
-                "keep_model_loaded": ("BOOLEAN", {"default": False}),
+                "keep_model_loaded": ("BOOLEAN", {"default": True}),
                 "max_new_tokens": ("INT", {"default": 1024, "min": 1, "max": 4096}),
                 "do_sample": ("BOOLEAN", {"default": False}),
             }
