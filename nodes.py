@@ -29,7 +29,7 @@ from decord import VideoReader, cpu
 
 # 添加类变量缓存模型
 loaded_model = None
-InternVL_model_name = "OpenGVLab/InternVL3-14B-Instruct"  # 设置默认模型名称
+InternVL_model_name = None  # 初始化为None
 
 class InternVLModelLoader:
     global loaded_model, InternVL_model_name  # 声明使用全局变量
@@ -39,9 +39,9 @@ class InternVLModelLoader:
             "required": {
                 "model": (
                     [
-                        "OpenGVLab/InternVL3-1B",
-                        "OpenGVLab/InternVL3-2B",
-                        "OpenGVLab/InternVL3-8B",
+                        "OpenGVLab/InternVL3-1B-Instruct",
+                        "OpenGVLab/InternVL3-2B-Instruct",
+                        "OpenGVLab/InternVL3-8B-Instruct",
                         "OpenGVLab/InternVL3-14B-Instruct",
                     ],
                     {
