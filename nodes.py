@@ -30,9 +30,10 @@ from decord import VideoReader, cpu
 # 添加类变量缓存模型
 loaded_model = None
 InternVL_model_name = None  # 初始化为None
+InternVL_model_quantized = None  # 初始化为None
 
 class InternVLModelLoader:
-    global loaded_model, InternVL_model_name  # 声明使用全局变量
+    global loaded_model, InternVL_model_name, InternVL_model_quantized  # 声明使用全局变量
     @classmethod
     def INPUT_TYPES(self):
         return {
@@ -47,6 +48,16 @@ class InternVLModelLoader:
                     {
                         "default": "OpenGVLab/InternVL3-14B-Instruct"
                     }),
+                "quantized": (
+                    [
+                        "load_in_4bit",
+                        "load_in_8bit",
+                    ],
+                    {
+                        "default": "load_in_4bit"
+                    }),
+
+                    
             }
         }
 
@@ -57,12 +68,13 @@ class InternVLModelLoader:
 
 
 
-    def load_model(self, model):
-        global loaded_model, InternVL_model_name  # 声明使用全局变量
+    def load_model(self, model, quantized):
+        global loaded_model, InternVL_model_name,InternVL_model_quantized  # 声明使用全局变量
         device = mm.get_torch_device()
 
         model_name = model.rsplit('/', 1)[-1]
         InternVL_model_name = model_name
+        InternVL_model_quantized = quantized
         model_dir = (os.path.join(folder_paths.models_dir, "LLM", model_name))
 
         if not os.path.exists(model_dir):
@@ -70,10 +82,19 @@ class InternVLModelLoader:
             snapshot_download(repo_id=model, cache_dir=model_dir, local_dir_use_symlinks=False)
             # huggingface-cli download --resume-download --local-dir-use-symlinks False OpenGVLab/InternVL2-2B --local-dir InternVL2-2B
 
+        # 根据量化方式设置对应的布尔值
+        if quantized == "load_in_4bit":
+            load_in_4bit_boolean = True
+            load_in_8bit_boolean = False
+        elif quantized == "load_in_8bit":
+            load_in_8bit_boolean = True
+            load_in_4bit_boolean = False
+        
+
         model = AutoModel.from_pretrained(
             model_dir,
-            #load_in_8bit=True,
-            load_in_4bit=True,
+            load_in_8bit=load_in_8bit_boolean,
+            load_in_4bit=load_in_4bit_boolean,
             torch_dtype=torch.float16,
             low_cpu_mem_usage=True,
             #device_map="auto",
@@ -91,7 +112,7 @@ class InternVLModelLoader:
     
     # 修改方法名为 ComfyUI 标准
     def HANDLE_CUSTOM_EVENT(self, node, event):
-        global loaded_model, InternVL_model_name
+        global loaded_model, InternVL_model_name, InternVL_model_quantized
         if event.get("action") == "unload_model":
             if loaded_model is not None:
                 print("开始卸载模型...")
@@ -309,7 +330,7 @@ class DynamicPreprocess:
         return transform
 
 class InternVLHFInference:
-    global loaded_model, InternVL_model_name  # 声明使用全局变量
+    global loaded_model, InternVL_model_name, InternVL_model_quantized  # 声明使用全局变量
     video_IMAGENET_MEAN = (0.485, 0.456, 0.406)
     video_IMAGENET_STD = (0.229, 0.224, 0.225)
 
@@ -351,7 +372,7 @@ class InternVLHFInference:
                 max_new_tokens=1024,
                 do_sample=False):
         
-        global loaded_model, InternVL_model_name  # 声明使用全局变量
+        global loaded_model, InternVL_model_name, InternVL_model_quantized  # 声明使用全局变量
         
         mm.soft_empty_cache()
         device = mm.get_torch_device()
@@ -376,9 +397,12 @@ class InternVLHFInference:
 
             # 确保有有效的模型名称
             current_model_name = InternVL_model_name if InternVL_model_name else "OpenGVLab/InternVL3-14B-Instruct"
+            current_model_quantized = InternVL_model_quantized if InternVL_model_quantized else "load_in_4bit"
 
-            model = model_loader.load_model(InternVL_model_name)[0]
+            model = model_loader.load_model(InternVL_model_name,InternVL_model_quantized)[0]
             print(f"✅ 新模型加载成功: {current_model_name}")
+            print(f"✅ 量化加载成功: {current_model_quantized}")
+
 
             # 缓存模型如果设置了保持加载
             if keep_model_loaded:
