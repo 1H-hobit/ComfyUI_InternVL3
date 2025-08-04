@@ -96,6 +96,7 @@ class InternVLModelLoader:
             load_in_8bit=load_in_8bit_boolean,
             load_in_4bit=load_in_4bit_boolean,
             torch_dtype=torch.float16,
+            use_flash_attn=True,
             low_cpu_mem_usage=True,
             #device_map="auto",
             trust_remote_code=True).eval()
