@@ -46,7 +46,7 @@ class InternVLModelLoader:
                         "OpenGVLab/InternVL3-14B-Instruct",
                     ],
                     {
-                        "default": "OpenGVLab/InternVL3-14B-Instruct"
+                        "default": "OpenGVLab/InternVL3-8B-Instruct"
                     }),
                 "quantized": (
                     [
@@ -54,14 +54,14 @@ class InternVLModelLoader:
                         "load_in_8bit",
                     ],
                     {
-                        "default": "load_in_4bit"
+                        "default": "load_in_8bit"
                     }),
 
                     
             }
         }
 
-    RETURN_TYPES = ("InternVLModel",)
+    RETURN_TYPES = ("MODEL",)
     RETURN_NAMES = ("intervl_model",)
     FUNCTION = "load_model"
     CATEGORY = "internvl"
@@ -341,17 +341,30 @@ class InternVLHFInference:
             "required": {
                 "system_prompt": ("STRING", {
                     "multiline": True,
-                    "default": "详细描述不要包含任何Markdown格式的图片标记，不需要图片缩略图片回复，直接输出文字描述内容。"
+                    "default": """你是一位专业的AI图片描述工程师，擅长将图片转化为高质量、细节丰富、自然流畅的语言描述。
+输出格式：
+- 使用自然流畅的语言描述，避免机械堆砌关键词
+- 按照视觉重要性排序元素，主体描述在前，环境氛围在后
+- 直接输出完整语言描述，不添加解释、分类标签或注释
+- 控制语言描述长度在适当范围内，确保核心元素突出
+
+请直接返回自然流畅的语言描述，不需要解释你的思考过程或添加额外说明或任何Markdown格式的图片标记。
+                                """
                 }),
                 "prompt": ("STRING", {
                     "multiline": True,
-                    "default": "请用一段自然语言的句子详细描述场景图片有哪些特点？包括场景图片的风格、色调、材质、造型、装饰、以及外观设计细节。所有物品需要明确数量，并说明相关场景元素位于场景图片的那个方位？"
+                    "default": """先描述摄影角度是怎样？
+然后详细描述场景图片的所有场景信息？
+所有场景元素需要明确数量，并说明相关场景元素位于图片的位置。
+包括所有人物的外貌、头发颜色、服装、姿态；
+所有场景元素的风格、颜色色调、材质、造型、装饰以及外观设计细节。
+                                """
                 }),
             },
             "optional": {
                 "image": ("IMAGE",),
                 "video_path": ("STRING", {"default": ""}),
-                "model": ("InternVLModel",),
+                "model": ("MODEL",),
                 "keep_model_loaded": ("BOOLEAN", {"default": True}),
                 "max_new_tokens": ("INT", {"default": 1024, "min": 1, "max": 4096}),
                 "do_sample": ("BOOLEAN", {"default": False}),
