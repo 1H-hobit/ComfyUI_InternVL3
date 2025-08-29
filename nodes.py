@@ -32,6 +32,74 @@ loaded_model = None
 InternVL_model_name = None  # 初始化为None
 InternVL_model_quantized = None  # 初始化为None
 
+class hb_Number_Counter:
+    def __init__(self):
+        self.counters = {}
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "number_type": (["integer", "float"],),
+                "mode": (["increment", "decrement", "increment_to_restart", "decrement_to_restart"],),
+                "start": ("FLOAT", {"default": 0, "min": -18446744073709551615, "max": 18446744073709551615, "step": 0.01}),
+                "stop": ("FLOAT", {"default": 0, "min": -18446744073709551615, "max": 18446744073709551615, "step": 0.01}),
+                "step": ("FLOAT", {"default": 1, "min": 0, "max": 99999, "step": 0.01}),
+            },
+            "optional": {
+                "reset_bool": ("NUMBER",),
+            },
+            "hidden": {
+                "unique_id": "UNIQUE_ID",
+            }
+        }
+
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        return float("NaN")
+
+    RETURN_TYPES = ("STRING", "FLOAT", "INT")
+    RETURN_NAMES = ("STRING", "float", "int")
+    FUNCTION = "hb_increment_number"
+
+    CATEGORY = "internvl"
+
+    def hb_increment_number(self, number_type, mode, start, stop, step, unique_id, reset_bool=0):
+
+        counter = int(start) if mode == 'integer' else start
+        if self.counters.__contains__(unique_id):
+            counter = self.counters[unique_id]
+
+        if round(reset_bool) >= 1:
+            counter = start
+
+        # 根据模式更新计数器
+        if mode == 'increment':
+            counter += step
+        elif mode == 'decrement':  # 修复了原代码中的拼写错误(deccrement)
+            counter -= step
+        elif mode == 'increment_to_restart':
+            # 不满足条件时重置为start
+            if counter < stop:
+                counter += step
+            else:
+                counter = start
+        elif mode == 'decrement_to_restart':
+            # 不满足条件时重置为start
+            if counter > stop:
+                counter -= step
+            else:
+                counter = start
+
+        self.counters[unique_id] = counter
+        
+        # 格式化结果
+        hb_result = int(counter) if number_type == 'integer' else float(counter)
+        # 注意：原代码中返回的字符串格式化可能不适用于浮点数，这里保持原样
+        result = f"{hb_result:04d}" if number_type == 'integer' else str(hb_result)
+        return (result, float(counter), int(counter))
+
+
 class InternVLModelLoader:
     global loaded_model, InternVL_model_name, InternVL_model_quantized  # 声明使用全局变量
     @classmethod
@@ -676,12 +744,15 @@ NODE_CLASS_MAPPINGS = {
     "InternVLModelLoader": InternVLModelLoader,
     "DynamicPreprocess": DynamicPreprocess,
     "InternVLHFInference": InternVLHFInference,
+    "hb_Number_Counter": hb_Number_Counter,
 }
+#class要一致
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "InternVLModelLoader": "InternVL Model Loader",
     "DynamicPreprocess": "Dynamic Preprocess",
     "InternVLHFInference": "InternVL HF Inference",
+    "hb_Number_Counter": "计数器",
 }
 
 # 修改文件底部的路由处理函数
