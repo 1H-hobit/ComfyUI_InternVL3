@@ -425,6 +425,7 @@ class InternVLHFInference:
                     "default": """先描述摄影角度是怎样？然后详细描述场景图片的所有场景信息？所有场景元素需要明确数量，并说明相关场景元素位于图片的位置。包括所有人物的外貌、头发颜色、服装、姿态；所有场景元素的风格、颜色色调、材质、造型、装饰以及外观设计细节。
 """
                 }),
+                "seed": ("INT", {"default": -1, "min": -1, "max": 0xffffffffffffffff}),
             },
             "optional": {
                 "image": ("IMAGE",),
@@ -432,7 +433,7 @@ class InternVLHFInference:
                 "model": ("MODEL",),
                 "keep_model_loaded": ("BOOLEAN", {"default": True}),
                 "max_new_tokens": ("INT", {"default": 1024, "min": 1, "max": 4096}),
-                "do_sample": ("BOOLEAN", {"default": False}),
+                "do_sample": ("BOOLEAN", {"default": True}),
             }
         }
 
@@ -444,14 +445,23 @@ class InternVLHFInference:
     def process(self,
                 system_prompt,  # 必需参数第一位
                 prompt,         # 必需参数第二位
+                seed=-1,  # 新增参数
                 image=None,     # 可选参数，添加默认值
                 video_path=None,# 可选参数，添加默认值
                 model=None,     # 可选参数，添加默认值
                 keep_model_loaded=False,
                 max_new_tokens=1024,
-                do_sample=False):
+                do_sample=True):
         
         global loaded_model, InternVL_model_name, InternVL_model_quantized  # 声明使用全局变量
+
+        # 设置随机种子
+        if seed == -1:
+            # 生成随机种子
+            seed = torch.seed() % (0xffffffffffffffff + 1)
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
         
         mm.soft_empty_cache()
         device = mm.get_torch_device()
@@ -493,7 +503,12 @@ class InternVLHFInference:
         
         # 准备流式输出
         streamer = TextIteratorStreamer(tokenizer, timeout=60)
-        generation_config = dict(max_new_tokens=max_new_tokens, do_sample=do_sample, streamer=streamer)
+        # 生成配置中加入种子相关设置
+        generation_config = dict(
+            max_new_tokens=max_new_tokens,
+            do_sample=do_sample,
+            streamer=streamer,
+        )
 
         # 处理视频输入
         if video_path and video_path.strip():
