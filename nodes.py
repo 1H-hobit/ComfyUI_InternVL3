@@ -1,7 +1,7 @@
 # 在文件顶部添加
 from server import PromptServer
 from aiohttp import web  # 添加这行导入
-
+import json
 import os
 import folder_paths
 import comfy.model_management as mm
@@ -31,6 +31,129 @@ from decord import VideoReader, cpu
 loaded_model = None
 InternVL_model_name = None  # 初始化为None
 InternVL_model_quantized = None  # 初始化为None
+
+class Florence2toCoordinates_hb:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "data": ("BBOXES", ),
+                "index": ("STRING", {"default": "0"}),
+                "batch": ("BOOLEAN", {"default": False}),
+            },
+        }
+    
+    # 1. 修改返回类型：新增 bboxes_flat_xywh（第四个返回值）
+    RETURN_TYPES = ("STRING", "BBOXES", "BBOX", "BBOX")
+    # 2. 对应修改返回名称：明确 XYXY 和 XYWH 格式
+    RETURN_NAMES = ("center_coordinates", "BBOXES", "BBOX_xyxy", "BBOX_xywh")
+    FUNCTION = "segment_hb"
+    CATEGORY = "internvl"
+
+    def segment_hb(self, data, index, batch=False):
+        center_points = []
+        bboxes_batch = []  # 二维结构：[[批次1的框], [批次2的框], ...] 用于BBOXES返回
+        # 3. 重命名：bboxes_flat → bboxes_flat_xyxy（保留 XYXY 格式：min_x, min_y, max_x, max_y）
+        bboxes_flat_xyxy = []  
+        # 4. 新增：bboxes_flat_xywh（XYWH 格式：min_x, min_y, width, height）
+        bboxes_flat_xywh = []   
+        
+        try:
+            # 处理data的JSON解析
+            if isinstance(data, str):
+                data = json.loads(data.replace("'", '"'))  # 兼容单引号JSON
+            
+            # 验证data格式：必须是二维列表（如[[[x1,y1,x2,y2], ...], ...]）
+            if not isinstance(data, list) or (len(data) > 0 and not isinstance(data[0], list)):
+                print("Invalid data format: expected 2D list")
+                # 异常场景：返回空的新增列表
+                return (json.dumps(center_points), bboxes_batch, bboxes_flat_xyxy, bboxes_flat_xywh)
+
+            # 处理索引：支持逗号分隔的字符串（如"0,2"）
+            if index.strip():
+                indexes = [int(i.strip()) for i in index.split(",") if i.strip().isdigit()]
+            else:
+                # 索引为空时，使用第一批次的所有边界框索引
+                indexes = list(range(len(data[0]))) if len(data) > 0 and len(data[0]) > 0 else []
+
+            print("Indexes:", indexes)
+
+            if batch:
+                # 批量处理：保留批次维度（BBOXES）同时生成两种格式的一维元组列表
+                for i in range(len(data)):
+                    current_batch = []
+                    for idx in indexes:
+                        if 0 <= idx < len(data[i]):
+                            bbox = data[i][idx]
+                            # 检查是否以[0, 0, ...]开头，如果是则替换为[0, 0, 0, 0]
+                            if len(bbox) >= 2 and bbox[0] == 0 and bbox[1] == 0:
+                                bbox = [0, 0, 0, 0]
+                            min_x, min_y, max_x, max_y = map(int, bbox[:4])
+                            
+                            # 计算中心点
+                            center_x = (min_x + max_x) // 2
+                            center_y = (min_y + max_y) // 2
+                            center_points.append({"x": center_x, "y": center_y})
+                            
+                            # 5. 维护 XYXY 格式列表（元组）
+                            bboxes_flat_xyxy.append((min_x, min_y, max_x, max_y))
+                            # 6. 计算并维护 XYWH 格式列表（元组：width=max_x-min_x，height=max_y-min_y）
+                            width = max_x - min_x
+                            height = max_y - min_y
+                            bboxes_flat_xywh.append((min_x, min_y, width, height))
+                            
+                            # 原逻辑：BBOXES 批次列表（保持列表格式兼容）
+                            current_batch.append([min_x, min_y, max_x, max_y])
+                    if current_batch:
+                        bboxes_batch.append(current_batch)
+            else:
+                # 非批量模式：仅处理第一批次
+                if len(data) == 0:
+                    # 异常场景：返回空的新增列表
+                    return (json.dumps(center_points), bboxes_batch, bboxes_flat_xyxy, bboxes_flat_xywh)
+                
+                first_batch = data[0]
+                current_batch = []  # 用于BBOXES的单批次二维结构
+                for idx in indexes:
+                    if 0 <= idx < len(first_batch):
+                        bbox = first_batch[idx]
+                        # 检查是否以[0, 0, ...]开头，如果是则替换为[0, 0, 0, 0]
+                        if len(bbox) >= 2 and bbox[0] == 0 and bbox[1] == 0:
+                            bbox = [0, 0, 0, 0]
+                        min_x, min_y, max_x, max_y = map(int, bbox[:4])
+                        
+                        # 计算中心点
+                        center_x = (min_x + max_x) // 2
+                        center_y = (min_y + max_y) // 2
+                        center_points.append({"x": center_x, "y": center_y})
+                        
+                        # 7. 维护 XYXY 格式列表（元组）
+                        bboxes_flat_xyxy.append((min_x, min_y, max_x, max_y))
+                        # 8. 计算并维护 XYWH 格式列表（元组）
+                        width = max_x - min_x
+                        height = max_y - min_y
+                        bboxes_flat_xywh.append((min_x, min_y, width, height))
+                        
+                        # 原逻辑：BBOXES 批次列表（保持列表格式兼容）
+                        current_batch.append([min_x, min_y, max_x, max_y])
+                    else:
+                        print(f"Warning: Index {idx} out of range in non-batch mode")
+                if current_batch:
+                    bboxes_batch.append(current_batch)  # 保持BBOXES的二维结构
+
+            # 调试日志：打印两种格式的结果（便于验证）
+            print("Batch BBoxes (2D):", bboxes_batch)
+            print("Flat BBoxes XYXY (1D):", bboxes_flat_xyxy)  # 格式：[(x1,y1,x2,y2), ...]
+            print("Flat BBoxes XYWH (1D):", bboxes_flat_xywh)  # 格式：[(x1,y1,w,h), ...]
+            
+            # 9. 返回值：新增 bboxes_flat_xywh 作为第四个返回值
+            return (json.dumps(center_points), bboxes_batch, bboxes_flat_xyxy, bboxes_flat_xywh)
+
+        except Exception as e:
+            print(f"Error processing data: {str(e)}")
+            # 异常场景：返回空的新增列表
+            return (json.dumps(center_points), bboxes_batch, bboxes_flat_xyxy, bboxes_flat_xywh)
+        
 
 class hb_Number_Counter:
     def __init__(self):
@@ -756,6 +879,7 @@ class InternVLHFInference:
 
 
 NODE_CLASS_MAPPINGS = {
+    "Florence2toCoordinates_hb": Florence2toCoordinates_hb,
     "InternVLModelLoader": InternVLModelLoader,
     "DynamicPreprocess": DynamicPreprocess,
     "InternVLHFInference": InternVLHFInference,
@@ -764,6 +888,7 @@ NODE_CLASS_MAPPINGS = {
 #class要一致
 
 NODE_DISPLAY_NAME_MAPPINGS = {
+    "Florence2toCoordinates_hb": "Florence2 BBOXES 坐标",
     "InternVLModelLoader": "InternVL Model Loader",
     "DynamicPreprocess": "Dynamic Preprocess",
     "InternVLHFInference": "InternVL HF Inference",
