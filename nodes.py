@@ -26,11 +26,268 @@ from threading import Thread
 import torchvision.transforms as T
 from torchvision.transforms.functional import InterpolationMode  # 图像插值模式
 from decord import VideoReader, cpu
+from typing import List, Union
 
 # 添加类变量缓存模型
 loaded_model = None
 InternVL_model_name = None  # 初始化为None
 InternVL_model_quantized = None  # 初始化为None
+
+class BBOXES_XYXY_Converter:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "convert_mode": (
+                    ["BBOXES_to_XYXY", "XYXY_to_BBOXES"],
+                    {"default": "BBOXES_to_XYXY", "description": "转换方向：BBOXES批量格式↔XYXY扁平格式"}
+                ),
+                "index": ("STRING", {"default": "", "description": "筛选框的索引（空=全部，多索引用逗号分隔）"}),
+                "batch_mode": ("BOOLEAN", {"default": True, "description": "BBOXES转XYXY时是否处理所有批次"}),
+                "invalid_threshold": ("INT", {"default": 0, "min": 0, "max": 10, "description": "无效框判断阈值（x1≤阈值且y1≤阈值）"}),
+                "keep_invalid_boxes": ("BOOLEAN", {"default": True, "description": "是否在输出中保留无效框"}),
+            },
+            "optional": {
+                "input_bboxes": ("BBOXES", ),
+                "input_bbox": ("BBOX", ),
+            }
+        }
+    
+    RETURN_TYPES = ("BBOXES", "BBOX", "INT", "INT", "STRING")
+    RETURN_NAMES = ("output_BBOXES", "output_BBOX_xyxy", "valid_count", "invalid_count", "conversion_log")
+    FUNCTION = "convert_bbox_data"
+    CATEGORY = "internvl"
+
+    def _parse_indexes(self, index_str, max_len):
+        """解析索引字符串"""
+        if not index_str.strip():
+            return list(range(max_len))
+        try:
+            indexes = [int(i.strip()) for i in index_str.split(",") if i.strip().isdigit()]
+            return indexes if indexes else list(range(max_len))
+        except:
+            return list(range(max_len))
+
+    def _is_valid_bbox(self, bbox, invalid_threshold):
+        """检查是否为有效边界框"""
+        if not isinstance(bbox, (list, tuple)) or len(bbox) < 4:
+            return False
+        x1, y1 = bbox[0], bbox[1]
+        return not (x1 <= invalid_threshold and y1 <= invalid_threshold)
+
+    def _normalize_input_data(self, data):
+        """标准化输入数据格式"""
+        if isinstance(data, str):
+            try:
+                data = json.loads(data.replace("'", '"'))
+            except:
+                pass
+        
+        # 确保返回列表格式
+        if data is None:
+            return []
+        return data
+
+    def convert_bbox_data(self, convert_mode, index, batch_mode, invalid_threshold, keep_invalid_boxes=True, input_bboxes=None, input_bbox=None):
+        conversion_log = [f"=== BBOXES与XYXY转换器 ==="]
+        conversion_log.append(f"转换模式: {convert_mode}")
+        conversion_log.append(f"索引筛选: '{index}'")
+        conversion_log.append(f"批量模式: {batch_mode}")
+        conversion_log.append(f"无效阈值: {invalid_threshold}")
+        conversion_log.append(f"保留无效框: {keep_invalid_boxes}")
+
+        # 输入验证
+        if input_bboxes is not None and input_bbox is not None:
+            error_msg = "错误：不能同时提供 input_bboxes 和 input_bbox"
+            conversion_log.append(error_msg)
+            return ([], [], 0, 0, "\n".join(conversion_log))
+
+        if input_bboxes is None and input_bbox is None:
+            error_msg = "错误：必须提供 input_bboxes 或 input_bbox"
+            conversion_log.append(error_msg)
+            return ([], [], 0, 0, "\n".join(conversion_log))
+
+        output_bboxes = []
+        output_xyxy = []
+        valid_count = 0
+        invalid_count = 0
+
+        try:
+            if convert_mode == "BBOXES_to_XYXY":
+                # BBOXES → XYXY 转换
+                if input_bbox is not None:
+                    error_msg = "错误：BBOXES_to_XYXY 模式需要 input_bboxes 输入"
+                    conversion_log.append(error_msg)
+                    return ([], [], 0, 0, "\n".join(conversion_log))
+
+                # 标准化输入数据
+                bboxes_data = self._normalize_input_data(input_bboxes)
+                
+                if not isinstance(bboxes_data, list) or not bboxes_data:
+                    error_msg = "错误：input_bboxes 必须是非空列表"
+                    conversion_log.append(error_msg)
+                    return ([], [], 0, 0, "\n".join(conversion_log))
+
+                conversion_log.append(f"输入BBOXES结构: {len(bboxes_data)}个批次")
+
+                # 确定处理的批次范围
+                batches_to_process = bboxes_data if batch_mode else [bboxes_data[0]] if bboxes_data else []
+                conversion_log.append(f"处理 {len(batches_to_process)} 个批次")
+
+                # 处理每个批次
+                all_boxes = []  # 存储所有框（包括无效框）
+                for batch_idx, batch in enumerate(batches_to_process):
+                    if not isinstance(batch, list):
+                        conversion_log.append(f"批次 {batch_idx}: 跳过（非列表格式）")
+                        continue
+                        
+                    conversion_log.append(f"批次 {batch_idx}: {len(batch)} 个框")
+                    
+                    # 解析索引
+                    target_indexes = self._parse_indexes(index, len(batch))
+                    conversion_log.append(f"  处理索引: {target_indexes}")
+
+                    for box_idx in target_indexes:
+                        if 0 <= box_idx < len(batch):
+                            bbox = batch[box_idx]
+                            
+                            # 检查有效性
+                            is_valid = self._is_valid_bbox(bbox, invalid_threshold)
+                            
+                            # 取前4个坐标值
+                            if isinstance(bbox, (list, tuple)) and len(bbox) >= 4:
+                                x1, y1, x2, y2 = map(int, bbox[:4])
+                                
+                                # 始终添加到输出（根据keep_invalid_boxes参数决定是否保留无效框）
+                                if keep_invalid_boxes or is_valid:
+                                    all_boxes.append([x1, y1, x2, y2])
+                                
+                                # 统计计数
+                                if is_valid:
+                                    valid_count += 1
+                                    conversion_log.append(f"  索引 {box_idx}: 有效框 [{x1}, {y1}, {x2}, {y2}]")
+                                else:
+                                    invalid_count += 1
+                                    conversion_log.append(f"  索引 {box_idx}: 无效框 [{x1}, {y1}, {x2}, {y2}]")
+                            else:
+                                invalid_count += 1
+                                conversion_log.append(f"  索引 {box_idx}: 格式错误")
+                        else:
+                            invalid_count += 1
+                            conversion_log.append(f"  索引 {box_idx}: 超出范围（批次长度: {len(batch)}）")
+
+                # 设置输出
+                output_bboxes = bboxes_data  # 保持原始BBOXES结构
+                output_xyxy = all_boxes  # 返回所有框（包括无效框）
+
+            elif convert_mode == "XYXY_to_BBOXES":
+                # XYXY → BBOXES 转换
+                if input_bboxes is not None:
+                    error_msg = "错误：XYXY_to_BBOXES 模式需要 input_bbox 输入"
+                    conversion_log.append(error_msg)
+                    return ([], [], 0, 0, "\n".join(conversion_log))
+
+                # 标准化输入数据
+                xyxy_data = self._normalize_input_data(input_bbox)
+                
+                if not xyxy_data:
+                    error_msg = "错误：input_bbox 数据为空"
+                    conversion_log.append(error_msg)
+                    return ([], [], 0, 0, "\n".join(conversion_log))
+
+                # 统一数据格式为列表的列表
+                flat_boxes = []
+                if isinstance(xyxy_data, (list, tuple)):
+                    if len(xyxy_data) == 4 and all(isinstance(x, (int, float)) for x in xyxy_data):
+                        # 单框情况
+                        flat_boxes = [list(xyxy_data)]
+                    elif all(isinstance(item, (list, tuple)) for item in xyxy_data):
+                        # 多框情况
+                        flat_boxes = [list(box) for box in xyxy_data]
+                    else:
+                        # 尝试解析为扁平列表
+                        if len(xyxy_data) % 4 == 0:
+                            flat_boxes = [list(xyxy_data[i:i+4]) for i in range(0, len(xyxy_data), 4)]
+                        else:
+                            error_msg = "错误：input_bbox 格式不正确"
+                            conversion_log.append(error_msg)
+                            return ([], [], 0, 0, "\n".join(conversion_log))
+                else:
+                    error_msg = f"错误：不支持的输入类型 {type(xyxy_data)}"
+                    conversion_log.append(error_msg)
+                    return ([], [], 0, 0, "\n".join(conversion_log))
+
+                conversion_log.append(f"输入XYXY数据: {len(flat_boxes)} 个框")
+
+                # 解析索引
+                target_indexes = self._parse_indexes(index, len(flat_boxes))
+                conversion_log.append(f"处理索引: {target_indexes}")
+
+                # 处理每个框
+                all_boxes = []
+                for idx in target_indexes:
+                    if 0 <= idx < len(flat_boxes):
+                        bbox = flat_boxes[idx]
+                        is_valid = self._is_valid_bbox(bbox, invalid_threshold)
+                        
+                        if isinstance(bbox, (list, tuple)) and len(bbox) >= 4:
+                            x1, y1, x2, y2 = map(int, bbox[:4])
+                            
+                            # 始终添加到输出（根据keep_invalid_boxes参数决定是否保留无效框）
+                            if keep_invalid_boxes or is_valid:
+                                all_boxes.append([x1, y1, x2, y2])
+                            
+                            # 统计计数
+                            if is_valid:
+                                valid_count += 1
+                                conversion_log.append(f"索引 {idx}: 有效框 [{x1}, {y1}, {x2}, {y2}]")
+                            else:
+                                invalid_count += 1
+                                conversion_log.append(f"索引 {idx}: 无效框 [{x1}, {y1}, {x2}, {y2}]")
+                        else:
+                            invalid_count += 1
+                            conversion_log.append(f"索引 {idx}: 格式错误")
+                    else:
+                        invalid_count += 1
+                        conversion_log.append(f"索引 {idx}: 超出范围（总框数: {len(flat_boxes)}）")
+
+                # 构建BBOXES格式：每个框作为一个单独的批次
+                output_bboxes = [[box] for box in all_boxes] if all_boxes else []
+                output_xyxy = all_boxes  # 返回所有框（包括无效框）
+
+            # 生成结果统计
+            conversion_log.append("")
+            conversion_log.append("=== 转换结果 ===")
+            conversion_log.append(f"有效框数量: {valid_count}")
+            conversion_log.append(f"无效框数量: {invalid_count}")
+            conversion_log.append(f"输出BBOXES格式: {len(output_bboxes)}个批次")
+            if output_bboxes:
+                conversion_log.append(f"BBOXES结构: 共{len(output_bboxes)}个批次")
+                for i, batch in enumerate(output_bboxes[:3]):  # 只显示前3个批次作为示例
+                    conversion_log.append(f"  批次{i}: {len(batch)}个框")
+                if len(output_bboxes) > 3:
+                    conversion_log.append(f"  ... 还有{len(output_bboxes)-3}个批次")
+            
+            conversion_log.append(f"输出BBOX(XYXY)数量: {len(output_xyxy)}个框")
+            if output_xyxy:
+                # 显示前几个框作为示例
+                conversion_log.append(f"BBOX(XYXY)示例:")
+                for i, box in enumerate(output_xyxy[:5]):  # 显示前5个框
+                    status = "有效" if self._is_valid_bbox(box, invalid_threshold) else "无效"
+                    conversion_log.append(f"  框{i}: {box} ({status})")
+                if len(output_xyxy) > 5:
+                    conversion_log.append(f"  ... 还有{len(output_xyxy)-5}个框")
+
+        except Exception as e:
+            error_msg = f"转换过程中发生错误: {str(e)}"
+            conversion_log.append(error_msg)
+            import traceback
+            conversion_log.append(traceback.format_exc())
+
+        conversion_log_str = "\n".join(conversion_log)
+        print(conversion_log_str)
+
+        return (output_bboxes, output_xyxy, valid_count, invalid_count, conversion_log_str)
 
 class Florence2toCoordinates_hb:
     @classmethod
@@ -921,6 +1178,7 @@ class InternVLHFInference:
 
 
 NODE_CLASS_MAPPINGS = {
+    "BBOXES_XYXY_Converter": BBOXES_XYXY_Converter,
     "Florence2toCoordinates_hb": Florence2toCoordinates_hb,
     "InternVLModelLoader": InternVLModelLoader,
     "DynamicPreprocess": DynamicPreprocess,
@@ -930,7 +1188,8 @@ NODE_CLASS_MAPPINGS = {
 #class要一致
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "Florence2toCoordinates_hb": "Florence2 BBOXES 坐标",
+    "BBOXES_XYXY_Converter": "BBoxes与XYXY互换",  # ComfyUI中显示的节点名称
+    "Florence2toCoordinates_hb": "Florence2 BBoxes 坐标",
     "InternVLModelLoader": "InternVL Model Loader",
     "DynamicPreprocess": "Dynamic Preprocess",
     "InternVLHFInference": "InternVL HF Inference",
