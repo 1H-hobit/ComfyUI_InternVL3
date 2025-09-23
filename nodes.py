@@ -313,6 +313,13 @@ class BBOXES_XYXY_Converter:
 
         conversion_log_str = "\n".join(conversion_log)
         print(conversion_log_str)
+        
+        print("=" * 50)
+        print("output_bboxes:\n",output_bboxes)
+        print("output_xyxy:\n", output_xyxy)
+        print("output_xywh:\n", output_xywh)
+        print("=" * 50)
+
 
         return (output_bboxes, output_xyxy, output_xywh, valid_count, invalid_count, conversion_log_str)
 
@@ -327,106 +334,117 @@ class Florence2toCoordinates_hb:
             },
         }
     
-    # 新增返回类型：BBOXES_first_mask（第一个有效BBOX）、first_mask_index（对应序号）
+    # 新增返回类型：BBOXES_first_mask（第一个有效BBOX，三维列表格式）、first_mask_index（对应序号）
     RETURN_TYPES = ("STRING", "BBOXES", "BBOX", "BBOX", "BBOXES", "INT")
-    # 对应修改返回名称，明确新增字段含义
+    # 明确返回名称含义，便于ComfyUI节点使用
     RETURN_NAMES = (
         "center_coordinates", 
         "BBOXES", 
         "BBOX_xyxy", 
         "BBOX_xywh", 
-        "BBOXES_first_mask",  # 第一个非[0,0,...]的BBOX（BBOXES类型）
+        "BBOXES_first_mask",  # 第一个非[0,0,...]的BBOX（格式：[[[x1,y1,x2,y2]]]）
         "first_mask_index"    # 第一个有效BBOX的序号（未找到时为-1）
     )
     FUNCTION = "segment_hb"
     CATEGORY = "internvl"
 
     def segment_hb(self, data, index, batch=False):
-        center_points = []
-        bboxes_batch = []  # 二维结构：[[批次1的框], [批次2的框], ...] 用于BBOXES返回
-        bboxes_flat_xyxy = []  # XYXY格式：min_x, min_y, max_x, max_y（元组列表）
-        bboxes_flat_xywh = []  # XYWH格式：min_x, min_y, width, height（元组列表）
+        center_points = []  # 存储中心点坐标（JSON格式输出）
+        bboxes_batch = []   # 二维列表：[[批次1的框], [批次2的框], ...]（对应BBOXES返回类型）
+        bboxes_flat_xyxy = []  # 扁平列表：[(x1,y1,x2,y2), ...]（对应BBOX_xyxy返回类型）
+        bboxes_flat_xywh = []  # 扁平列表：[(x1,y1,w,h), ...]（对应BBOX_xywh返回类型）
         
-        # 新增：初始化第一个有效BBOX相关变量
-        first_mask_bbox = None  # 存储第一个非[0,0,...]的BBOX（BBOXES类型：二维列表）
-        first_mask_index = -1   # 存储第一个有效BBOX的序号（未找到时为-1）
-        found_first = False     # 标记是否已找到第一个有效BBOX
-        
+        # 初始化第一个有效BBOX相关变量（核心修改：默认三维空列表，保证格式一致性）
+        first_mask_bbox = [[[]]]  # 格式：[[[x1,y1,x2,y2]]]，无有效框时为[[[]]]
+        first_mask_index = -1     # 未找到有效框时为-1
+        found_first = False       # 标记是否已找到第一个有效框
+
         try:
-            # 处理data的JSON解析（兼容字符串格式的BBOXES）
+            # 1. 处理BBOXES数据格式：兼容字符串格式的JSON数据
             if isinstance(data, str):
-                data = json.loads(data.replace("'", '"'))  # 替换单引号为双引号，避免JSON解析错误
+                # 替换单引号为双引号，避免JSON解析错误
+                data = json.loads(data.replace("'", '"'))
             
-            # 验证data格式：必须是二维列表（如[[[x1,y1,x2,y2], ...], ...]）
+            # 2. 验证数据格式：必须是二维列表（批次→框→坐标）
             if not isinstance(data, list) or (len(data) > 0 and not isinstance(data[0], list)):
                 print("Invalid data format: expected 2D list (batch -> bboxes -> coordinates)")
-                # 异常场景：返回空值+默认序号-1
-                return (json.dumps(center_points), bboxes_batch, bboxes_flat_xyxy, bboxes_flat_xywh, [], -1)
+                # 异常场景：返回标准格式空值
+                return (
+                    json.dumps(center_points), 
+                    bboxes_batch, 
+                    bboxes_flat_xyxy, 
+                    bboxes_flat_xywh, 
+                    first_mask_bbox,  # 保持[[[]]]格式
+                    first_mask_index
+                )
 
-            # 处理索引：支持逗号分隔的多索引（如"0,2,5"），空索引则取第一批次所有框
+            # 3. 解析索引：支持逗号分隔多索引（如"0,2,5"），空索引取第一批次所有框
             if index.strip():
+                # 过滤非数字索引，避免无效值
                 indexes = [int(i.strip()) for i in index.split(",") if i.strip().isdigit()]
             else:
+                # 空索引时，若有数据则取第一批次所有框，否则为空列表
                 indexes = list(range(len(data[0]))) if (len(data) > 0 and len(data[0]) > 0) else []
 
             print("Processing indexes:", indexes)
 
+            # 4. 批量模式：遍历所有批次，处理指定索引的BBOX
             if batch:
-                # 批量模式：遍历所有批次，处理指定索引的BBOX
                 for batch_idx, batch_data in enumerate(data):  # batch_idx：当前批次序号
-                    current_batch = []
+                    current_batch = []  # 存储当前批次的有效框
                     for idx in indexes:  # idx：当前批次内的BBOX索引
+                        # 检查索引是否在当前批次的有效范围内
                         if 0 <= idx < len(batch_data):
                             raw_bbox = batch_data[idx]
-                            # 检查是否以[0,0,...]开头（无效框标记）
+                            # 判断是否为无效框（以[0,0,...]开头）
                             is_zero_bbox = len(raw_bbox) >= 2 and raw_bbox[0] == 0 and raw_bbox[1] == 0
                             
-                            # 处理无效框：替换为[0,0,0,0]，有效框取前4个坐标值
-                            if is_zero_bbox:
-                                processed_bbox = [0, 0, 0, 0]
-                            else:
-                                processed_bbox = raw_bbox[:4]  # 确保只取x1,y1,x2,y2四坐标
-                            
+                            # 处理框坐标：无效框设为[0,0,0,0]，有效框取前4个坐标（x1,y1,x2,y2）
+                            processed_bbox = [0, 0, 0, 0] if is_zero_bbox else raw_bbox[:4]
                             min_x, min_y, max_x, max_y = map(int, processed_bbox)
                             
-                            # 计算中心点坐标
+                            # 计算中心点坐标（整数化，避免浮点数）
                             center_x = (min_x + max_x) // 2
                             center_y = (min_y + max_y) // 2
                             center_points.append({"x": center_x, "y": center_y})
                             
-                            # 维护两种格式的扁平BBOX列表
-                            bboxes_flat_xyxy.append((min_x, min_y, max_x, max_y))
-                            bboxes_flat_xywh.append((min_x, min_y, max_x - min_x, max_y - min_y))
+                            # 维护各格式的BBOX列表
+                            current_batch.append([min_x, min_y, max_x, max_y])  # 批量BBOXES格式
+                            bboxes_flat_xyxy.append((min_x, min_y, max_x, max_y))  # XYXY扁平格式
+                            bboxes_flat_xywh.append((min_x, min_y, max_x - min_x, max_y - min_y))  # XYWH扁平格式
                             
-                            # 维护批量BBOX列表（兼容原始BBOXES类型）
-                            current_batch.append([min_x, min_y, max_x, max_y])
-                            
-                            # 新增：找到第一个非[0,0,...]的有效BBOX（仅记录一次）
+                            # 核心修改：找到第一个有效框时，赋值为三维列表格式[[[x1,y1,x2,y2]]]
                             if not found_first and not is_zero_bbox:
-                                first_mask_bbox = [[min_x, min_y, max_x, max_y]]  # BBOXES要求二维列表
-                                # 序号格式：批次序号_当前批次内索引（如“1_0”），转为整数便于后续处理
-                                first_mask_index = batch_idx * len(batch_data) + idx  
-                                found_first = True  # 标记已找到，后续不再处理
+                                first_mask_bbox = [[[min_x, min_y, max_x, max_y]]]
+                                # 序号格式：批次序号_当前批次内索引（如批次1的第0个框为1_0，转为整数便于后续处理）
+                                first_mask_index = batch_idx * len(batch_data) + idx
+                                found_first = True  # 标记已找到，避免重复赋值
+                    # 将当前批次的有效框加入批量列表（空批次不加入，避免冗余）
                     if current_batch:
                         bboxes_batch.append(current_batch)
+
+            # 5. 非批量模式：仅处理第一批次数据
             else:
-                # 非批量模式：仅处理第一批次数据
+                # 检查第一批次是否有数据
                 if len(data) == 0 or len(data[0]) == 0:
                     print("Non-batch mode: no valid bboxes in first batch")
-                    return (json.dumps(center_points), bboxes_batch, bboxes_flat_xyxy, bboxes_flat_xywh, [], -1)
+                    return (
+                        json.dumps(center_points), 
+                        bboxes_batch, 
+                        bboxes_flat_xyxy, 
+                        bboxes_flat_xywh, 
+                        first_mask_bbox, 
+                        first_mask_index
+                    )
                 
-                first_batch = data[0]
-                current_batch = []
-                for idx in indexes:  # idx：第一批次内的BBOX索引
+                first_batch = data[0]  # 仅取第一批次
+                current_batch = []     # 存储第一批次的有效框
+                for idx in indexes:    # 遍历指定索引
                     if 0 <= idx < len(first_batch):
                         raw_bbox = first_batch[idx]
                         is_zero_bbox = len(raw_bbox) >= 2 and raw_bbox[0] == 0 and raw_bbox[1] == 0
                         
-                        if is_zero_bbox:
-                            processed_bbox = [0, 0, 0, 0]
-                        else:
-                            processed_bbox = raw_bbox[:4]
-                        
+                        processed_bbox = [0, 0, 0, 0] if is_zero_bbox else raw_bbox[:4]
                         min_x, min_y, max_x, max_y = map(int, processed_bbox)
                         
                         # 计算中心点
@@ -434,52 +452,55 @@ class Florence2toCoordinates_hb:
                         center_y = (min_y + max_y) // 2
                         center_points.append({"x": center_x, "y": center_y})
                         
-                        # 维护两种格式的扁平BBOX列表
+                        # 维护各格式的BBOX列表
+                        current_batch.append([min_x, min_y, max_x, max_y])
                         bboxes_flat_xyxy.append((min_x, min_y, max_x, max_y))
                         bboxes_flat_xywh.append((min_x, min_y, max_x - min_x, max_y - min_y))
                         
-                        # 维护批量BBOX列表
-                        current_batch.append([min_x, min_y, max_x, max_y])
-                        
-                        # 新增：找到第一个非[0,0,...]的有效BBOX
+                        # 核心修改：找到第一个有效框时，赋值为三维列表格式[[[x1,y1,x2,y2]]]
                         if not found_first and not is_zero_bbox:
-                            first_mask_bbox = [[min_x, min_y, max_x, max_y]]  # 符合BBOXES类型要求
-                            first_mask_index = idx  # 非批量模式直接用批次内索引作为序号
+                            first_mask_bbox = [[[min_x, min_y, max_x, max_y]]]
+                            first_mask_index = idx  # 非批量模式直接用批次内索引
                             found_first = True
                     else:
+                        # 索引超出范围时打印警告
                         print(f"Warning: Index {idx} out of range (non-batch mode, first batch length: {len(first_batch)})")
+                # 将第一批次的有效框加入批量列表
                 if current_batch:
                     bboxes_batch.append(current_batch)
 
-            # 新增：处理未找到有效BBOX的场景
-            if not found_first:
-                first_mask_bbox = []  # 无有效框时返回空BBOXES
-                first_mask_index = -1  # 无有效框时序号为-1
-
-            # 调试日志：打印所有关键结果（便于验证）
+            # 6. 调试日志：打印关键结果（便于验证格式和数据正确性）
             print("=" * 50)
             print("Batch BBoxes (2D list):", bboxes_batch)
             print("Flat BBoxes (XYXY):", bboxes_flat_xyxy)
             print("Flat BBoxes (XYWH):", bboxes_flat_xywh)
-            print("First valid BBOX (BBOXES):", first_mask_bbox)
+            print("First valid BBOX (BBOXES):", first_mask_bbox)  # 输出格式：[[[x1,y1,x2,y2]]]
             print("First valid BBOX index:", first_mask_index)
             print("=" * 50)
             
-            # 返回所有值（新增字段放在最后）
+            # 7. 返回所有结果（严格对应RETURN_TYPES顺序）
+            return (
+                json.dumps(center_points),  # 中心点坐标（JSON字符串）
+                bboxes_batch,               # 批量BBOXES（二维列表）
+                bboxes_flat_xyxy,           # 扁平XYXY（元组列表）
+                bboxes_flat_xywh,           # 扁平XYWH（元组列表）
+                first_mask_bbox,            # 第一个有效BBOX（三维列表：[[[x1,y1,x2,y2]]]）
+                first_mask_index            # 第一个有效BBOX序号（-1表示无）
+            )
+
+        # 8. 异常处理：捕获所有错误，返回标准格式空值
+        except Exception as e:
+            print(f"Error processing BBOXES: {str(e)}")
+            import traceback
+            traceback.print_exc()  # 打印详细错误栈，便于调试
             return (
                 json.dumps(center_points), 
                 bboxes_batch, 
                 bboxes_flat_xyxy, 
                 bboxes_flat_xywh, 
-                first_mask_bbox, 
+                first_mask_bbox,  # 保持[[[]]]格式
                 first_mask_index
-            )
-
-        except Exception as e:
-            print(f"Error processing BBOXES: {str(e)}")
-            # 异常场景：返回空值+默认序号-1
-            return (json.dumps(center_points), bboxes_batch, bboxes_flat_xyxy, bboxes_flat_xywh, [], -1)
-        
+            ) 
 
 class hb_Number_Counter:
     def __init__(self):
