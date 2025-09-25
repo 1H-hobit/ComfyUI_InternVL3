@@ -566,7 +566,7 @@ class hb_Number_Counter:
         # 格式化结果
         hb_result = int(counter) if number_type == 'integer' else float(counter)
         # 注意：原代码中返回的字符串格式化可能不适用于浮点数，这里保持原样
-        result = f"{hb_result:04d}" if number_type == 'integer' else str(hb_result)
+        result = f"{hb_result:03d}" if number_type == 'integer' else str(hb_result)
         return (result, float(counter), int(counter))
 
 
