@@ -582,6 +582,7 @@ class InternVLModelLoader:
                         "OpenGVLab/InternVL3-2B-Instruct",
                         "OpenGVLab/InternVL3-8B-Instruct",
                         "OpenGVLab/InternVL3-14B-Instruct",
+                        "OpenGVLab/InternVL3_5-8B-Instruct",
                     ],
                     {
                         "default": "OpenGVLab/InternVL3-8B-Instruct"
@@ -636,7 +637,7 @@ class InternVLModelLoader:
             torch_dtype=torch.float16,
             use_flash_attn=True,
             low_cpu_mem_usage=True,
-            #device_map="auto",
+            #device_map="cuda:0",
             trust_remote_code=True).eval()
         
         tokenizer = AutoTokenizer.from_pretrained(model_dir,trust_remote_code=True)
@@ -971,8 +972,12 @@ class InternVLHFInference:
         internvl_model = model['model']
         tokenizer = model['tokenizer']
         
+        # 获取模型的数据类型
+        model_dtype = next(internvl_model.parameters()).dtype
+        print(f"模型数据类型: {model_dtype}")
+
         # 准备流式输出
-        streamer = TextIteratorStreamer(tokenizer, timeout=60)
+        streamer = TextIteratorStreamer(tokenizer, timeout=10)
         # 生成配置中加入种子相关设置
         generation_config = dict(
             max_new_tokens=max_new_tokens,
@@ -990,7 +995,7 @@ class InternVLHFInference:
             # 确保数据在GPU上
             if torch.cuda.is_available():
                 # 将数据转换为bfloat16格式并转移到GPU
-                pixel_values = pixel_values.to(torch.float16).cuda()
+                pixel_values = pixel_values.to(model_dtype).cuda()
                 
             # 构造视频前缀：为每个帧生成"FrameX: <image>\n"格式的文本
             video_prefix = ''.join([f'Frame{i+1}: <image>\n' for i in range(len(num_patches_list))])
@@ -1011,7 +1016,7 @@ class InternVLHFInference:
         # 处理图像输入
         elif image is not None:
             print("处理图像输入")
-            image = image.to(torch.float16).to(device)
+            image = image.to(model_dtype).to(device)
             num_patches_list = [image.size(0)]  # 有图像时设置
 
             question = f'<image>\n{system_prompt}\n{prompt}'
